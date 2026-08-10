@@ -85,7 +85,13 @@ impl AutomassApp {
             connected: false,
             connecting: false,
             run_mode: RunMode::Mpc,
-            xy_pre_balance: true,
+            // MATLAB's `XYPreCheckbox` is an unchecked `uicheckbox` (only the
+            // XY-preset button ever sets it), so `MainConstantTs11.m:76`
+            // takes the `else` branch and runs `ModelInit(app, d0)` — the
+            // GUI-tunable preset. Defaulting this to `true` here silently put
+            // the rig on `ModelInit_PostBalance`'s hardcoded tuning instead,
+            // with the whole Tuning tab inert.
+            xy_pre_balance: false,
             controller_on: true,
             mass_solver: MassSolver::Pinv,
             running: false,
@@ -618,7 +624,22 @@ impl AutomassApp {
     }
 
     fn monitor_tab(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("⚙ Tuning (MPC weights + manual jog speed/accel)", |ui| {
+        ui.collapsing("⚙ Tuning (MPC + LQI weights, motor speed/accel)", |ui| {
+            // `ModelInit_PostBalance.m` hardcodes its own q/qi/qd/R/du_max/
+            // d_track_tol and never reads the GUI — so with the preset
+            // checkbox on, every weight below except speed/accel is dead and
+            // `Tune Now` re-linearizes with the same numbers. Silent in
+            // MATLAB; say it out loud instead of letting an operator drag
+            // knobs that do nothing.
+            if self.xy_pre_balance && self.run_mode == RunMode::Mpc {
+                ui.label(
+                    egui::RichText::new(
+                        "⚠ 'XY pre-balanced' is on — MPC uses ModelInit_PostBalance's \
+                         hardcoded weights and ignores everything below except speed/accel.",
+                    )
+                    .color(egui::Color32::from_rgb(220, 160, 60)),
+                );
+            }
             egui::Grid::new("weights_grid")
                 .num_columns(2)
                 .show(ui, |ui| {

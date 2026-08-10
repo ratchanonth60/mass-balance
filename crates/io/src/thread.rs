@@ -8,7 +8,7 @@
 //! `Bus` never has two writers.
 
 use crate::commands::{MassSolver, RunMode, TuneWeights, UiCommand};
-use crate::lqi_loop::{LqiLoop, LqiWeights};
+use crate::lqi_loop::LqiLoop;
 use crate::mks_ops;
 use crate::mpc_loop::MpcLoop;
 use crate::telemetry::Telemetry;
@@ -370,7 +370,7 @@ fn handle_command(
                             }
                         }
                     }
-                    RunMode::Lqi => match LqiLoop::init(bus.as_mut(), &LqiWeights::default()) {
+                    RunMode::Lqi => match LqiLoop::init(bus.as_mut(), &(*weights).into()) {
                         Some(mut l) => {
                             l.mass_solver = *mass_solver;
                             l.spd = weights.jog_spd;
@@ -381,8 +381,9 @@ fn handle_command(
                             *run = Run::Idle;
                             let _ = tx.send(Telemetry {
                                 connected: true,
-                                status: "LQI init timed out: jog all 4 axes above ~50mm first, \
-                                         then retry Start Auto"
+                                status: "LQI init failed: jog all 4 axes above ~50mm first, \
+                                         or check the tuning weights (R = 0 or an all-zero \
+                                         Q makes the gain solve singular)"
                                     .to_string(),
                                 ..Default::default()
                             });
@@ -392,11 +393,24 @@ fn handle_command(
             }
         }
         UiCommand::Stop => *run = Run::Idle,
-        UiCommand::TuneNow => {
-            if let Run::Mpc { loop_ } = run {
-                loop_.retune(&(*weights).into());
+        UiCommand::TuneNow => match run {
+            Run::Mpc { loop_ } => loop_.retune(&(*weights).into()),
+            // Re-solving the LQI gains means a fresh Riccati recursion right
+            // here, between control cycles — a few ms, one cadence boundary
+            // at worst, and cheaper than the Stop/Start it replaces.
+            Run::Lqi { loop_ } => {
+                if !loop_.retune(&(*weights).into()) {
+                    let _ = tx.send(Telemetry {
+                        connected: true,
+                        status: "Tune Now: LQI gain solve failed, keeping previous gains \
+                                 (check R and Q — R = 0 is singular)"
+                            .to_string(),
+                        ..Default::default()
+                    });
+                }
             }
-        }
+            _ => {}
+        },
         UiCommand::SetManualPoll(on) => {
             if on {
                 if matches!(run, Run::Idle) {

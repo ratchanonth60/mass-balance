@@ -17,11 +17,19 @@ const D_MIN: f64 = 0.001;
 const D_MAX: f64 = 0.495;
 const D0_CENTER: f64 = 0.20; // "CoR reference plane" nominal center
 
-/// GUI-tunable LQI weights (`app.q1..q5EditField`, `app.qiEditField`, `app.REditField`).
+/// GUI-tunable LQI weights (`InitLQR.m` lines 105-114 and 163-164).
+///
+/// `InitLQR.m` reads `app.qiEditField.Value` for a single shared integral
+/// weight — but that component **does not exist** in AutoMass_MPC.mlapp (0
+/// occurrences in document.xml; only `qi1EditField`/`qi2EditField` are ever
+/// created). So MATLAB's LQI mode threw "Unrecognized property" at loop
+/// entry and never ran with GUI weights at all. Ported as the two separate
+/// weights the GUI actually has, which is what `ModelInit.m` already does
+/// for the MPC path.
 #[derive(Debug, Clone, Copy)]
 pub struct LqiWeights {
     pub qx: [f64; 5],
-    pub qi: f64,
+    pub qi: [f64; 2],
     pub r: f64,
     pub du_max: f64,
     pub d_track_tol: f64,
@@ -31,11 +39,66 @@ impl Default for LqiWeights {
     fn default() -> Self {
         Self {
             qx: [100.0, 100.0, 50.0, 50.0, 25.0],
-            qi: 1.0,
+            qi: [1.0, 1.0],
             r: 50.0,
             du_max: 0.05,
             d_track_tol: 0.08,
         }
+    }
+}
+
+impl From<crate::commands::TuneWeights> for LqiWeights {
+    fn from(w: crate::commands::TuneWeights) -> Self {
+        // The Tuning tab drives one shared set of fields for both run modes,
+        // same as the MATLAB GUI. `qd` has no LQI counterpart (no d-state in
+        // the 7-state augmented model) and is dropped.
+        Self {
+            qx: w.q,
+            qi: w.qi,
+            r: w.r,
+            du_max: w.du_max,
+            d_track_tol: w.d_track_tol,
+        }
+    }
+}
+
+/// `Qx`/`Qi`/`R` assembly + `dlqr`. `None` if the Riccati recursion doesn't
+/// converge — reachable now that these come from UI DragValues (r = 0 makes
+/// the problem singular), and this runs outside the IO thread's
+/// `catch_unwind`, so it must not panic.
+fn solve_gains(weights: &LqiWeights) -> Option<(DMatrix<f64>, DMatrix<f64>)> {
+    // The DARE needs R positive-definite and Q positive-semi-definite. The
+    // recursion happily returns finite garbage for R = 0 or a negative
+    // weight instead of failing, so reject those up front — the Tuning tab's
+    // DragValues have no lower bound and drag straight through zero.
+    if !(weights.r > 0.0 && weights.r.is_finite())
+        || weights
+            .qx
+            .iter()
+            .chain(weights.qi.iter())
+            .any(|v| !v.is_finite() || *v < 0.0)
+    {
+        return None;
+    }
+
+    let (ad, bd) = lqi_model::build_augmented(1.0);
+    let mut q_aug = DMatrix::<f64>::zeros(7, 7);
+    q_aug.view_mut((0, 0), (5, 5)).copy_from(&DMatrix::from_diagonal(
+        &DVector::from_row_slice(&weights.qx),
+    ));
+    q_aug[(5, 5)] = weights.qi[0];
+    q_aug[(6, 6)] = weights.qi[1];
+    // `InitLQR.m:114` builds `diag([r r r/2])`, but line 112 crashes first, so
+    // that halved yaw penalty has never actually run. `r*I3` is what produced
+    // the real `Ctrl_LQR.mat` gains the tests check against — keep it.
+    let r = DMatrix::from_diagonal(&DVector::from_row_slice(&[weights.r; 3]));
+
+    let k = dare::solve(&ad, &bd, &q_aug, &r, 1e-10, 2000).ok()?.k;
+    let (kx, ki) = (k.columns(0, 5).into_owned(), k.columns(5, 2).into_owned());
+    if kx.iter().chain(ki.iter()).all(|v| v.is_finite()) {
+        Some((kx, ki))
+    } else {
+        None
     }
 }
 
@@ -71,18 +134,7 @@ impl LqiLoop {
     /// never reaches the 0.05m threshold within [`INIT_POLL_TIMEOUT`] —
     /// masses need to already be jogged above ~50mm before Start Auto.
     pub fn init(bus: &mut dyn Bus, weights: &LqiWeights) -> Option<Self> {
-        let (ad, bd) = lqi_model::build_augmented(1.0);
-        let mut q_aug = DMatrix::<f64>::zeros(7, 7);
-        q_aug.view_mut((0, 0), (5, 5)).copy_from(&DMatrix::from_diagonal(
-            &DVector::from_row_slice(&weights.qx),
-        ));
-        q_aug[(5, 5)] = weights.qi;
-        q_aug[(6, 6)] = weights.qi;
-        let r = DMatrix::from_diagonal(&DVector::from_row_slice(&[weights.r; 3]));
-
-        let dare_result = dare::solve(&ad, &bd, &q_aug, &r, 1e-10, 2000).expect("DARE solve failed");
-        let kx = dare_result.k.columns(0, 5).into_owned();
-        let ki = dare_result.k.columns(5, 2).into_owned();
+        let (kx, ki) = solve_gains(weights)?;
 
         let mut d0 = [0.0f64; 4];
         for addr in 1..=4u8 {
@@ -122,6 +174,24 @@ impl LqiLoop {
             spd: DEFAULT_SPD,
             acc: DEFAULT_ACC,
         })
+    }
+
+    /// `Tune Now` for the LQI path: re-solve the gains and pick up the new
+    /// rate limit / tracking gate without restarting the run (so the KF
+    /// estimate, integral error and encoder priming all survive). `false`
+    /// if the new weights don't produce usable gains — old ones are kept,
+    /// the loop keeps running on them.
+    pub fn retune(&mut self, weights: &LqiWeights) -> bool {
+        match solve_gains(weights) {
+            Some((kx, ki)) => {
+                self.kx = kx;
+                self.ki = ki;
+                self.du_max = weights.du_max;
+                self.d_track_tol = weights.d_track_tol;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn one_step(&mut self, bus: &mut dyn Bus, plant_t: f64) -> Telemetry {
@@ -326,6 +396,36 @@ mod tests {
         // Kx should be a real, finite, non-degenerate gain (not NaN/all-zero).
         assert!(lqi.kx.iter().all(|v| v.is_finite()));
         assert!(lqi.kx.iter().any(|&v| v.abs() > 1e-6));
+    }
+
+    /// `Tune Now` on a running LQI loop has to actually move the gains, and
+    /// degenerate weights coming straight off a UI DragValue must fail as a
+    /// `false`/`None`, not a panic — the gain solve runs on the IO thread
+    /// outside `thread::run`'s `catch_unwind`, so a panic there would kill
+    /// the thread and freeze the UI for good.
+    #[test]
+    fn retune_updates_gains_and_rejects_degenerate_weights() {
+        let mut bus = MockBus::default();
+        for addr in 1..=4u8 {
+            push_encoder_reply(&mut bus, addr, 0.2);
+        }
+        let mut lqi = LqiLoop::init(&mut bus, &LqiWeights::default()).unwrap();
+        let kx_before = lqi.kx.clone();
+
+        let mut w = LqiWeights::default();
+        w.r = 500.0; // 10x the control penalty -> softer gains
+        w.du_max = 0.02;
+        assert!(lqi.retune(&w));
+        assert!((&lqi.kx - &kx_before).amax() > 1e-6);
+        assert_eq!(lqi.du_max, 0.02);
+
+        // R = 0 makes the Riccati recursion singular.
+        let mut bad = LqiWeights::default();
+        bad.r = 0.0;
+        let kx_now = lqi.kx.clone();
+        assert!(!lqi.retune(&bad));
+        assert_eq!(lqi.kx, kx_now, "failed retune must keep the old gains");
+        assert!(LqiLoop::init(&mut bus, &bad).is_none());
     }
 
     #[test]
