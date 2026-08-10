@@ -1,0 +1,15 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "automass"
+path = "src/main.rs"
+
+[dependencies]
+io = { workspace = true }
+eframe = { workspace = true }
+egui_plot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

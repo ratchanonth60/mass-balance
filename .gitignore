@@ -1,0 +1,8 @@
+target/
+# Stray per-member lockfiles from running cargo inside crates/*; the
+# workspace root Cargo.lock is the only one cargo actually uses.
+/crates/*/Cargo.lock
+
+# Written at runtime by the Tuning tab's Save weights button, in whatever
+# directory the binary was launched from.
+/tune_weights.json
