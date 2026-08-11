@@ -54,7 +54,7 @@ pub fn run(rx: Receiver<UiCommand>, tx: Sender<Telemetry>) {
         // Drain every pending command before doing loop work — this is also
         // where `Stop`/`SetController`/`TuneNow` interrupt a running loop.
         while let Ok(cmd) = rx.try_recv() {
-            handle_command(
+            guarded_command(
                 cmd,
                 &mut bus,
                 &mut run,
@@ -126,7 +126,7 @@ pub fn run(rx: Receiver<UiCommand>, tx: Sender<Telemetry>) {
                 // Idle or disconnected: block on the next command instead of
                 // busy-polling.
                 match rx.recv() {
-                    Ok(cmd) => handle_command(
+                    Ok(cmd) => guarded_command(
                         cmd,
                         &mut bus,
                         &mut run,
@@ -203,6 +203,42 @@ fn sleep_remaining(started: Instant, plant_t: Duration) {
     // cadence timestamp would differ.
 }
 
+/// `handle_command` wrapped so a panic inside it can't take the IO thread
+/// with it. The loop bodies have had this since early on, but commands are
+/// where the heavy one-shot math actually lives — `MpcLoop::init` runs
+/// `build_ctrl` (linearization + batch matrices) and `LqiLoop::init` runs a
+/// full Riccati recursion, both on operator-supplied weights. A panic in
+/// either killed the thread outright: no telemetry ever again, no error, and
+/// Connect/Disconnect dead too, which from the UI is indistinguishable from
+/// "Start Auto produced no data".
+#[allow(clippy::too_many_arguments)]
+fn guarded_command(
+    cmd: UiCommand,
+    bus: &mut Option<Box<dyn Bus>>,
+    run: &mut Run,
+    weights: &mut TuneWeights,
+    mass_solver: &mut MassSolver,
+    xy_pre_balance: &mut bool,
+    tx: &Sender<Telemetry>,
+) {
+    let label = format!("{cmd:?}");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_command(cmd, bus, run, weights, mass_solver, xy_pre_balance, tx);
+    }));
+    if let Err(e) = result {
+        // Whatever was half-set-up is not trustworthy — drop back to Idle
+        // rather than leaving a partially-initialized loop in `run`.
+        *run = Run::Idle;
+        let _ = tx.send(Telemetry {
+            run_state: RunState::Idle,
+            connected: bus.is_some(),
+            status: format!("Command {label} crashed: {}", panic_msg(&e)),
+            ..Default::default()
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     cmd: UiCommand,
     bus: &mut Option<Box<dyn Bus>>,

@@ -476,6 +476,47 @@ mod tests {
         assert!(mpc.d_op.iter().all(|&d| (d - 0.2).abs() < 2e-3));
     }
 
+
+    /// The `ModelInit` preset (XY-pre-balance checkbox *off*) is the app
+    /// default and the only path that feeds the GUI tuning weights into the
+    /// model — yet every other init test here passes `true`, so it had no
+    /// coverage at all. Both presets must build and solve cleanly across the
+    /// rail; a panic in either kills the IO thread from inside
+    /// `handle_command`, which looks like "Start Auto produced no data".
+    #[test]
+    fn both_presets_build_and_solve_across_the_rail() {
+        let tw: TuningWeights = crate::commands::TuneWeights::default().into();
+        // Below ~0.02 the `push_encoder_reply` helper can't encode a faithful
+        // value (it clamps `degree`), so the priming poll would never clear
+        // its threshold — a harness limit, not a model limit.
+        for d0 in [0.02f64, 0.2, 0.45] {
+            for xy_pre_balance in [false, true] {
+                let mut bus = MockBus::default();
+                for addr in 1..=4u8 {
+                    push_encoder_reply(&mut bus, addr, d0);
+                }
+                let mut mpc = MpcLoop::init(&mut bus, xy_pre_balance, &tw, &mut |_| {})
+                    .unwrap_or_else(|| panic!("init failed at d0={d0} xy={xy_pre_balance}"));
+
+                for addr in 1..=4u8 {
+                    push_encoder_reply(&mut bus, addr, d0);
+                }
+                push_imu_reply(&mut bus, 0.5, -0.5);
+                let tel = mpc.one_step(&mut bus);
+
+                assert_eq!(
+                    tel.exitflag, 1,
+                    "d0={d0} xy={xy_pre_balance} should solve, not fall back"
+                );
+                assert!(
+                    tel.d_cmd.iter().all(|v| v.is_finite() && (D_MIN..=D_MAX).contains(v)),
+                    "d0={d0} xy={xy_pre_balance} produced out-of-range command {:?}",
+                    tel.d_cmd
+                );
+            }
+        }
+    }
+
     #[test]
     fn controller_off_sends_no_motor_commands() {
         let mut bus = MockBus::default();
