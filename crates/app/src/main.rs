@@ -48,6 +48,58 @@ fn exitflag_badge(flag: i32) -> (&'static str, egui::Color32) {
     }
 }
 
+/// สีกรมท่า — deep navy. Built on top of `Visuals::dark()` so every field not
+/// touched here keeps egui's tuned dark-mode contrast; only the greys are
+/// re-tinted. The status colors in `run_state_chip`/`exitflag_badge` stay as
+/// they are: they carry meaning (green/amber/red), not theme.
+fn navy_visuals() -> egui::Visuals {
+    use egui::{Color32 as C, Stroke};
+
+    let text = C::from_rgb(0xC7, 0xD2, 0xE6);
+    let mut v = egui::Visuals::dark();
+
+    v.panel_fill = C::from_rgb(0x12, 0x1B, 0x2E);
+    v.window_fill = C::from_rgb(0x16, 0x21, 0x38);
+    // Plot backgrounds and text-edit fields read from this one.
+    v.extreme_bg_color = C::from_rgb(0x0A, 0x11, 0x1F);
+    v.faint_bg_color = C::from_rgb(0x1A, 0x25, 0x3D);
+    v.code_bg_color = C::from_rgb(0x0E, 0x17, 0x28);
+    v.window_stroke = Stroke::new(1.0, C::from_rgb(0x2C, 0x3C, 0x5E));
+    v.hyperlink_color = C::from_rgb(0x7F, 0xA8, 0xE0);
+    v.selection.bg_fill = C::from_rgb(0x2E, 0x4A, 0x7D);
+    v.selection.stroke = Stroke::new(1.0, text);
+
+    // Widget ramp: each state one step lighter than the panel behind it.
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = C::from_rgb(0x1A, 0x25, 0x3D);
+    w.noninteractive.weak_bg_fill = C::from_rgb(0x1A, 0x25, 0x3D);
+    // Plot grid lines come off this stroke — keep it clear of `extreme_bg_color`.
+    w.noninteractive.bg_stroke = Stroke::new(1.0, C::from_rgb(0x2B, 0x3B, 0x5C));
+    w.noninteractive.fg_stroke = Stroke::new(1.0, C::from_rgb(0x92, 0xA3, 0xC1));
+
+    w.inactive.bg_fill = C::from_rgb(0x24, 0x32, 0x50);
+    w.inactive.weak_bg_fill = C::from_rgb(0x1E, 0x2B, 0x46);
+    w.inactive.bg_stroke = Stroke::new(1.0, C::from_rgb(0x30, 0x41, 0x66));
+    w.inactive.fg_stroke = Stroke::new(1.0, text);
+
+    w.hovered.bg_fill = C::from_rgb(0x33, 0x46, 0x6E);
+    w.hovered.weak_bg_fill = C::from_rgb(0x2B, 0x3C, 0x60);
+    w.hovered.bg_stroke = Stroke::new(1.0, C::from_rgb(0x4E, 0x6A, 0xA0));
+    w.hovered.fg_stroke = Stroke::new(1.5, C::WHITE);
+
+    w.active.bg_fill = C::from_rgb(0x3E, 0x57, 0x8B);
+    w.active.weak_bg_fill = C::from_rgb(0x3E, 0x57, 0x8B);
+    w.active.bg_stroke = Stroke::new(1.0, C::from_rgb(0x6E, 0x90, 0xC8));
+    w.active.fg_stroke = Stroke::new(2.0, C::WHITE);
+
+    w.open.bg_fill = C::from_rgb(0x24, 0x32, 0x50);
+    w.open.weak_bg_fill = C::from_rgb(0x1E, 0x2B, 0x46);
+    w.open.bg_stroke = Stroke::new(1.0, C::from_rgb(0x30, 0x41, 0x66));
+    w.open.fg_stroke = Stroke::new(1.0, text);
+
+    v
+}
+
 struct AutomassApp {
     tx: Sender<UiCommand>,
     rx: Receiver<Telemetry>,
@@ -1012,6 +1064,12 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "AutoMass",
         options,
-        Box::new(|_cc| Ok(Box::new(AutomassApp::new(tx_cmd, rx_tel)))),
+        Box::new(|cc| {
+            // Pin to dark so a light system theme can't swap the navy back out.
+            cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+            cc.egui_ctx
+                .set_visuals_of(egui::Theme::Dark, navy_visuals());
+            Ok(Box::new(AutomassApp::new(tx_cmd, rx_tel)))
+        }),
     )
 }
