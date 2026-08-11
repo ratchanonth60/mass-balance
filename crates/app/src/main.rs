@@ -606,39 +606,51 @@ impl AutomassApp {
         // silently eating that minute. Never blocks Start: a stale one-shot
         // read is not authoritative, and the operator may know the rig is
         // ready even if the UI's last reading is old.
-        let min_d = match self.run_mode {
-            RunMode::Mpc => io::mpc_loop::INIT_MIN_D,
-            RunMode::Lqi => io::lqi_loop::INIT_MIN_D,
-        };
-        let readiness = self.axis_readiness();
-        if readiness.iter().any(|v| v.is_none()) {
-            ui.label(
-                egui::RichText::new("↻ Read all encoders (left panel) to check readiness")
-                    .weak(),
-            );
-        } else {
-            let below: Vec<String> = readiness
-                .iter()
-                .enumerate()
-                .filter_map(|(i, v)| {
-                    v.filter(|&d| d < min_d)
-                        .map(|d| format!("Ax{} {:.1} cm", i + 1, d * 100.0))
-                })
-                .collect();
-            if below.is_empty() {
+        //
+        // Only shown before Start: `axis_readiness` treats `latest.d_meas`
+        // as live the instant `run_state` becomes Mpc/Lqi, but that flip
+        // happens on the "Initializing..." snapshot, sent *before* `init`'s
+        // encoder-priming poll has taken a single real reading — so right
+        // after clicking Start Auto, this used to flash "all axes 0.0 cm,
+        // jog up first" using stale/default data that had nothing to do
+        // with the rig's actual position. `!self.running` sidesteps that
+        // window entirely: once a run is active there's nothing left to
+        // preflight anyway.
+        if !self.running {
+            let min_d = match self.run_mode {
+                RunMode::Mpc => io::mpc_loop::INIT_MIN_D,
+                RunMode::Lqi => io::lqi_loop::INIT_MIN_D,
+            };
+            let readiness = self.axis_readiness();
+            if readiness.iter().any(|v| v.is_none()) {
                 ui.label(
-                    egui::RichText::new("✔ all axes ready")
-                        .color(egui::Color32::from_rgb(80, 180, 80)),
+                    egui::RichText::new("↻ Read all encoders (left panel) to check readiness")
+                        .weak(),
                 );
             } else {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "⚠ {} below {:.1} cm — jog up first",
-                        below.join(", "),
-                        min_d * 100.0
-                    ))
-                    .color(egui::Color32::from_rgb(220, 160, 60)),
-                );
+                let below: Vec<String> = readiness
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| {
+                        v.filter(|&d| d < min_d)
+                            .map(|d| format!("Ax{} {:.1} cm", i + 1, d * 100.0))
+                    })
+                    .collect();
+                if below.is_empty() {
+                    ui.label(
+                        egui::RichText::new("✔ all axes ready")
+                            .color(egui::Color32::from_rgb(80, 180, 80)),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⚠ {} below {:.1} cm — jog up first",
+                            below.join(", "),
+                            min_d * 100.0
+                        ))
+                        .color(egui::Color32::from_rgb(220, 160, 60)),
+                    );
+                }
             }
         }
 

@@ -76,7 +76,19 @@ impl MpcLoop {
     /// every reading is >= [`INIT_MIN_D`], then linearize at that `d0`.
     /// `None` if that never happens within [`INIT_POLL_TIMEOUT`] — masses
     /// need to already be jogged above ~10mm before Start Auto.
-    pub fn init(bus: &mut dyn Bus, xy_pre_balance: bool, weights: &TuningWeights) -> Option<Self> {
+    ///
+    /// `progress` is called once per poll pass with that pass's *raw* parse
+    /// result per axis (`None` = no reply, or a reply that didn't parse).
+    /// Without it this loop is silent for the full 60s while still driving
+    /// bus traffic — the rig's RX/TX lights blink but the UI shows nothing,
+    /// and "masses are below the threshold" is indistinguishable from
+    /// "encoder replies aren't parsing", which are very different problems.
+    pub fn init(
+        bus: &mut dyn Bus,
+        xy_pre_balance: bool,
+        weights: &TuningWeights,
+        progress: &mut dyn FnMut(&[Option<f64>; 4]),
+    ) -> Option<Self> {
         for addr in 1..=4u8 {
             mks_ops::run_rel(bus, addr, -0.001, 50.0, 128);
             sleep(MOTOR_PAUSE);
@@ -87,12 +99,22 @@ impl MpcLoop {
             if started.elapsed() > INIT_POLL_TIMEOUT {
                 return None;
             }
+            let mut pass = [None; 4];
             for (i, addr) in (1..=4u8).enumerate() {
-                if let Some(v) = mks_ops::read_encoder(bus, addr) {
+                // `is_finite` matters for more than hygiene here: the `while`
+                // above compares with `<`, and every comparison against NaN is
+                // false — so a single NaN reading would satisfy the loop
+                // condition, break out, and feed NaN straight into
+                // `linearize`, poisoning the whole run's model.
+                if let Some(v) = mks_ops::read_encoder(bus, addr)
+                    && v.is_finite()
+                {
                     d0[i] = v;
+                    pass[i] = Some(v);
                 }
                 sleep(Duration::from_millis(250));
             }
+            progress(&pass);
         }
 
         let preset = if xy_pre_balance {
@@ -418,7 +440,39 @@ mod tests {
         for addr in 1..=4u8 {
             push_encoder_reply(&mut bus, addr, 0.2);
         }
-        let mpc = MpcLoop::init(&mut bus, true, &weights()).unwrap();
+        let mpc = MpcLoop::init(&mut bus, true, &weights(), &mut |_| {}).unwrap();
+        assert!(mpc.d_op.iter().all(|&d| (d - 0.2).abs() < 2e-3));
+    }
+
+    /// The priming poll reports each pass, and an axis whose reply doesn't
+    /// parse comes back as `None` rather than being silently treated as a
+    /// 0.0 reading — that ambiguity made "masses too low" and "encoder
+    /// replies not parsing" look identical from the UI for a full 60s.
+    #[test]
+    fn init_progress_distinguishes_unparsable_replies_from_low_readings() {
+        let mut bus = MockBus::default();
+        // Pass 1: axes 1-3 answer normally, axis 4 returns garbage that
+        // can't be parsed — so the poll can't finish and has to go around.
+        for addr in 1..=3u8 {
+            push_encoder_reply(&mut bus, addr, 0.2);
+        }
+        bus.push_reply(vec![0x00, 0x01, 0x02]);
+        // Pass 2: axis 4 answers properly, clearing the threshold.
+        for addr in 1..=4u8 {
+            push_encoder_reply(&mut bus, addr, 0.2);
+        }
+
+        let mut passes: Vec<[Option<f64>; 4]> = Vec::new();
+        let mpc = MpcLoop::init(&mut bus, true, &weights(), &mut |pass| passes.push(*pass))
+            .expect("second pass clears the threshold");
+
+        assert_eq!(passes.len(), 2, "one progress report per poll pass");
+        assert!(passes[0][0].is_some(), "axis 1 parsed on pass 1");
+        assert!(
+            passes[0][3].is_none(),
+            "axis 4's garbage reply must report None, not a silent 0.0"
+        );
+        assert!(passes[1][3].is_some(), "axis 4 parsed on pass 2");
         assert!(mpc.d_op.iter().all(|&d| (d - 0.2).abs() < 2e-3));
     }
 
@@ -428,7 +482,7 @@ mod tests {
         for addr in 1..=4u8 {
             push_encoder_reply(&mut bus, addr, 0.2);
         }
-        let mut mpc = MpcLoop::init(&mut bus, true, &weights()).unwrap();
+        let mut mpc = MpcLoop::init(&mut bus, true, &weights(), &mut |_| {}).unwrap();
         mpc.controller_on = false;
 
         for addr in 1..=4u8 {
@@ -453,7 +507,7 @@ mod tests {
         for addr in 1..=4u8 {
             push_encoder_reply(&mut bus, addr, 0.2);
         }
-        let mut mpc = MpcLoop::init(&mut bus, true, &weights()).unwrap();
+        let mut mpc = MpcLoop::init(&mut bus, true, &weights(), &mut |_| {}).unwrap();
         mpc.spd = 180.0;
         mpc.acc = 64;
 
@@ -485,7 +539,7 @@ mod tests {
         }
         let mut w = weights();
         w.d_track_tol = 0.0001; // impossibly tight -> always gated
-        let mut mpc = MpcLoop::init(&mut bus, true, &w).unwrap();
+        let mut mpc = MpcLoop::init(&mut bus, true, &w, &mut |_| {}).unwrap();
         let prev_cmd = mpc.d_cmd_prev;
 
         for addr in 1..=4u8 {

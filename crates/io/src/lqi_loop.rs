@@ -138,7 +138,15 @@ impl LqiLoop {
     /// `InitLQR(app)` + the encoder-priming sequence. `None` if the poll
     /// never reaches [`INIT_MIN_D`] within [`INIT_POLL_TIMEOUT`] — masses
     /// need to already be jogged above ~50mm before Start Auto.
-    pub fn init(bus: &mut dyn Bus, weights: &LqiWeights) -> Option<Self> {
+    ///
+    /// `progress` reports each poll pass's raw per-axis parse result — see
+    /// [`crate::mpc_loop::MpcLoop::init`] for why the silent version was a
+    /// problem.
+    pub fn init(
+        bus: &mut dyn Bus,
+        weights: &LqiWeights,
+        progress: &mut dyn FnMut(&[Option<f64>; 4]),
+    ) -> Option<Self> {
         let (kx, ki) = solve_gains(weights)?;
 
         let mut d0 = [0.0f64; 4];
@@ -151,12 +159,19 @@ impl LqiLoop {
             if started.elapsed() > INIT_POLL_TIMEOUT {
                 return None;
             }
+            let mut pass = [None; 4];
             for (i, addr) in (1..=4u8).enumerate() {
-                if let Some(v) = mks_ops::read_encoder(bus, addr) {
+                // NaN would make the `<` above false and break the loop with a
+                // poisoned `d0` — see the MPC loop's note.
+                if let Some(v) = mks_ops::read_encoder(bus, addr)
+                    && v.is_finite()
+                {
                     d0[i] = v;
+                    pass[i] = Some(v);
                 }
                 sleep(Duration::from_millis(250));
             }
+            progress(&pass);
         }
         let d_init = saturate(d0);
 
@@ -380,7 +395,7 @@ mod tests {
         for addr in 1..=4u8 {
             push_encoder_reply(&mut bus, addr, 0.2);
         }
-        let lqi = LqiLoop::init(&mut bus, &LqiWeights::default()).unwrap();
+        let lqi = LqiLoop::init(&mut bus, &LqiWeights::default(), &mut |_| {}).unwrap();
 
         for i in 0..3 {
             for j in 0..5 {
@@ -398,7 +413,7 @@ mod tests {
         for addr in 1..=4u8 {
             push_encoder_reply(&mut bus, addr, 0.2);
         }
-        let lqi = LqiLoop::init(&mut bus, &LqiWeights::default()).unwrap();
+        let lqi = LqiLoop::init(&mut bus, &LqiWeights::default(), &mut |_| {}).unwrap();
         // Kx should be a real, finite, non-degenerate gain (not NaN/all-zero).
         assert!(lqi.kx.iter().all(|v| v.is_finite()));
         assert!(lqi.kx.iter().any(|&v| v.abs() > 1e-6));
@@ -415,7 +430,7 @@ mod tests {
         for addr in 1..=4u8 {
             push_encoder_reply(&mut bus, addr, 0.2);
         }
-        let mut lqi = LqiLoop::init(&mut bus, &LqiWeights::default()).unwrap();
+        let mut lqi = LqiLoop::init(&mut bus, &LqiWeights::default(), &mut |_| {}).unwrap();
         let kx_before = lqi.kx.clone();
 
         let mut w = LqiWeights::default();
@@ -431,7 +446,7 @@ mod tests {
         let kx_now = lqi.kx.clone();
         assert!(!lqi.retune(&bad));
         assert_eq!(lqi.kx, kx_now, "failed retune must keep the old gains");
-        assert!(LqiLoop::init(&mut bus, &bad).is_none());
+        assert!(LqiLoop::init(&mut bus, &bad, &mut |_| {}).is_none());
     }
 
     #[test]
@@ -440,7 +455,7 @@ mod tests {
         for addr in 1..=4u8 {
             push_encoder_reply(&mut bus, addr, 0.2);
         }
-        let mut lqi = LqiLoop::init(&mut bus, &LqiWeights::default()).unwrap();
+        let mut lqi = LqiLoop::init(&mut bus, &LqiWeights::default(), &mut |_| {}).unwrap();
         lqi.controller_on = false;
         let prev = lqi.d_cmd_prev;
 

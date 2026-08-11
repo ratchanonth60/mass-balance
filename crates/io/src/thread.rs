@@ -152,6 +152,27 @@ pub fn run(rx: Receiver<UiCommand>, tx: Sender<Telemetry>) {
     }
 }
 
+/// One line describing a priming-poll pass: per-axis reading, or `---` for an
+/// axis whose reply didn't arrive or didn't parse. The distinction is the
+/// whole point — all-`---` means the bus/addressing is wrong, real numbers
+/// below the threshold mean the masses genuinely need jogging up, and before
+/// this the operator saw neither for the full 60s the poll can run.
+fn priming_status(pass: &[Option<f64>; 4], min_d: f64) -> String {
+    let axes: Vec<String> = pass
+        .iter()
+        .enumerate()
+        .map(|(i, v)| match v {
+            Some(d) => format!("Ax{} {:.1}mm", i + 1, d * 1000.0),
+            None => format!("Ax{} ---", i + 1),
+        })
+        .collect();
+    format!(
+        "Priming encoders: {} (need >= {:.0}mm on all 4; '---' = no/bad reply)",
+        axes.join("  "),
+        min_d * 1000.0
+    )
+}
+
 fn run_state(run: &Run) -> RunState {
     match run {
         Run::Idle => RunState::Idle,
@@ -376,7 +397,21 @@ fn handle_command(
                 });
                 match mode {
                     RunMode::Mpc => {
-                        match MpcLoop::init(bus.as_mut(), *xy_pre_balance, &(*weights).into()) {
+                        let tx_progress = tx.clone();
+                        let mut progress = |pass: &[Option<f64>; 4]| {
+                            let _ = tx_progress.send(Telemetry {
+                                run_state: RunState::Mpc,
+                                connected: true,
+                                status: priming_status(pass, crate::mpc_loop::INIT_MIN_D),
+                                ..Default::default()
+                            });
+                        };
+                        match MpcLoop::init(
+                            bus.as_mut(),
+                            *xy_pre_balance,
+                            &(*weights).into(),
+                            &mut progress,
+                        ) {
                             Some(mut loop_) => {
                                 // `From<TuneWeights>` deliberately drops the
                                 // jog fields (not control-math weights), so
@@ -390,34 +425,47 @@ fn handle_command(
                                 let _ = tx.send(Telemetry {
                                     run_state: RunState::Idle,
                                     connected: true,
-                                    status: "MPC init timed out: jog all 4 axes above ~10mm \
-                                             first, then retry Start Auto"
+                                    status: "MPC init timed out. If the priming line showed \
+                                             '---' for an axis, that axis never replied (check \
+                                             addr/wiring/baud); if it showed real numbers, jog \
+                                             all 4 axes above ~10mm first."
                                         .to_string(),
                                     ..Default::default()
                                 });
                             }
                         }
                     }
-                    RunMode::Lqi => match LqiLoop::init(bus.as_mut(), &(*weights).into()) {
-                        Some(mut l) => {
-                            l.mass_solver = *mass_solver;
-                            l.spd = weights.jog_spd;
-                            l.acc = weights.jog_acc;
-                            *run = Run::Lqi { loop_: l };
-                        }
-                        None => {
-                            *run = Run::Idle;
-                            let _ = tx.send(Telemetry {
-                                run_state: RunState::Idle,
+                    RunMode::Lqi => {
+                        let tx_progress = tx.clone();
+                        let mut progress = |pass: &[Option<f64>; 4]| {
+                            let _ = tx_progress.send(Telemetry {
+                                run_state: RunState::Lqi,
                                 connected: true,
-                                status: "LQI init failed: jog all 4 axes above ~50mm first, \
-                                         or check the tuning weights (R = 0 or an all-zero \
-                                         Q makes the gain solve singular)"
-                                    .to_string(),
+                                status: priming_status(pass, crate::lqi_loop::INIT_MIN_D),
                                 ..Default::default()
                             });
+                        };
+                        match LqiLoop::init(bus.as_mut(), &(*weights).into(), &mut progress) {
+                            Some(mut l) => {
+                                l.mass_solver = *mass_solver;
+                                l.spd = weights.jog_spd;
+                                l.acc = weights.jog_acc;
+                                *run = Run::Lqi { loop_: l };
+                            }
+                            None => {
+                                *run = Run::Idle;
+                                let _ = tx.send(Telemetry {
+                                    run_state: RunState::Idle,
+                                    connected: true,
+                                    status: "LQI init failed: jog all 4 axes above ~50mm first, \
+                                             or check the tuning weights (R = 0 or an all-zero \
+                                             Q makes the gain solve singular)"
+                                        .to_string(),
+                                    ..Default::default()
+                                });
+                            }
                         }
-                    },
+                    }
                 };
             }
         }
