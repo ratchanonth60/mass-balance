@@ -11,7 +11,7 @@ use crate::commands::{MassSolver, RunMode, TuneWeights, UiCommand};
 use crate::lqi_loop::LqiLoop;
 use crate::mks_ops;
 use crate::mpc_loop::MpcLoop;
-use crate::telemetry::Telemetry;
+use crate::telemetry::{RunState, Telemetry};
 use crate::transport::{Bus, SerialBus};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -111,6 +111,7 @@ pub fn run(rx: Receiver<UiCommand>, tx: Sender<Telemetry>) {
                 }
                 *t += MANUAL_POLL_T.as_secs_f64();
                 let _ = tx.send(Telemetry {
+                    run_state: RunState::Manual,
                     connected: true,
                     is_sample: true,
                     manual_read: None,
@@ -142,11 +143,21 @@ pub fn run(rx: Receiver<UiCommand>, tx: Sender<Telemetry>) {
         if let Some(status) = crashed {
             run = Run::Idle;
             let _ = tx.send(Telemetry {
+                run_state: RunState::Idle,
                 connected: true,
                 status,
                 ..Default::default()
             });
         }
+    }
+}
+
+fn run_state(run: &Run) -> RunState {
+    match run {
+        Run::Idle => RunState::Idle,
+        Run::Manual { .. } => RunState::Manual,
+        Run::Mpc { .. } => RunState::Mpc,
+        Run::Lqi { .. } => RunState::Lqi,
     }
 }
 
@@ -166,9 +177,9 @@ fn sleep_remaining(started: Instant, plant_t: Duration) {
         std::thread::sleep(plant_t - elapsed);
     }
     // else: overran the cadence — proceed immediately to the next cycle
-    // rather than replicating MATLAB's same-index-reuse `continue` quirk
-    // (see plan file M3 notes); the control action already went out either
-    // way, only the logged cadence timestamp would differ.
+    // rather than replicating MATLAB's same-index-reuse `continue` quirk;
+    // the control action already went out either way, only the logged
+    // cadence timestamp would differ.
 }
 
 fn handle_command(
@@ -195,6 +206,7 @@ fn handle_command(
                 Ok(b) => {
                     *bus = Some(Box::new(b));
                     let _ = tx.send(Telemetry {
+                        run_state: run_state(run),
                         connected: true,
                         status: format!("Connected ({port})"),
                         ..Default::default()
@@ -203,6 +215,7 @@ fn handle_command(
                 Err(e) => {
                     *bus = None;
                     let _ = tx.send(Telemetry {
+                        run_state: run_state(run),
                         connected: false,
                         status: format!("Connect failed: {e}"),
                         ..Default::default()
@@ -214,6 +227,7 @@ fn handle_command(
             *bus = None;
             *run = Run::Idle;
             let _ = tx.send(Telemetry {
+                run_state: RunState::Idle,
                 connected: false,
                 status: "Disconnected".to_string(),
                 ..Default::default()
@@ -259,6 +273,7 @@ fn handle_command(
                     ),
                 };
                 let _ = tx.send(Telemetry {
+                    run_state: run_state(run),
                     connected: true,
                     manual_read: parsed.map(|v| (addr, v)),
                     status,
@@ -342,7 +357,19 @@ fn handle_command(
                 // `init()` blocks the IO thread for up to its poll timeout
                 // (encoder-priming poll) — tell the UI it's happening, since
                 // otherwise it just looks frozen for that whole stretch.
+                // Reports the *target* state, not `run_state(run)` (which is
+                // still whatever ran before Start Auto — typically `Idle`).
+                // The UI treats an `Idle` snapshot as "Start Auto didn't
+                // happen, clear the optimistic running flag" (see fix 1's
+                // rationale in the app crate); reporting the stale pre-init
+                // state here would trip that the instant this snapshot
+                // arrives, flickering "running" off during the several
+                // seconds `init`'s encoder-priming poll actually takes.
                 let _ = tx.send(Telemetry {
+                    run_state: match mode {
+                        RunMode::Mpc => RunState::Mpc,
+                        RunMode::Lqi => RunState::Lqi,
+                    },
                     connected: true,
                     status: "Initializing...".to_string(),
                     ..Default::default()
@@ -361,6 +388,7 @@ fn handle_command(
                             None => {
                                 *run = Run::Idle;
                                 let _ = tx.send(Telemetry {
+                                    run_state: RunState::Idle,
                                     connected: true,
                                     status: "MPC init timed out: jog all 4 axes above ~10mm \
                                              first, then retry Start Auto"
@@ -380,6 +408,7 @@ fn handle_command(
                         None => {
                             *run = Run::Idle;
                             let _ = tx.send(Telemetry {
+                                run_state: RunState::Idle,
                                 connected: true,
                                 status: "LQI init failed: jog all 4 axes above ~50mm first, \
                                          or check the tuning weights (R = 0 or an all-zero \
@@ -401,6 +430,7 @@ fn handle_command(
             Run::Lqi { loop_ } => {
                 if !loop_.retune(&(*weights).into()) {
                     let _ = tx.send(Telemetry {
+                        run_state: RunState::Lqi, // still running, just kept the old gains
                         connected: true,
                         status: "Tune Now: LQI gain solve failed, keeping previous gains \
                                  (check R and Q — R = 0 is singular)"

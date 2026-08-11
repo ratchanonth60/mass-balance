@@ -2,8 +2,25 @@
 //! cycle (replacing `DrawPlot`/`drawnow limitrate nocallbacks`) and after
 //! manual commands complete.
 
+/// What `crate::thread::run`'s `Run` enum currently holds, mirrored into
+/// every `Telemetry` so the UI can tell a real `Idle` (Stop was pressed, or
+/// `StartAuto` never got that far — e.g. init timed out or a loop panicked)
+/// from its own optimistic "a run is active" flag. Without this the UI has
+/// no way to notice `StartAuto` failed after showing "Initializing..." — it
+/// just stays stuck believing a run is in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunState {
+    #[default]
+    Idle,
+    Manual,
+    Mpc,
+    Lqi,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Telemetry {
+    /// Mirrors `crate::thread::Run` at the moment this snapshot was sent.
+    pub run_state: RunState,
     /// Whether the IO thread currently holds an open `Bus`. Also sent as a
     /// standalone snapshot (all other fields default) right after every
     /// `Connect`/`Disconnect` command, since those don't otherwise produce

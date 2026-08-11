@@ -66,11 +66,16 @@ pub struct MpcLoop {
 /// lets the caller report a clear error and stay `Idle` instead of hanging.
 const INIT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `init`'s encoder-priming poll won't return until every axis clears this —
+/// exposed so the UI can warn *before* Start Auto blocks for up to
+/// [`INIT_POLL_TIMEOUT`] and fails.
+pub const INIT_MIN_D: f64 = 0.01;
+
 impl MpcLoop {
     /// Replicates the init sequence: nudge all 4 axes, poll encoders until
-    /// every reading is >= 0.01 m, then linearize at that `d0`. `None` if
-    /// that never happens within [`INIT_POLL_TIMEOUT`] — masses need to
-    /// already be jogged above ~10mm before Start Auto.
+    /// every reading is >= [`INIT_MIN_D`], then linearize at that `d0`.
+    /// `None` if that never happens within [`INIT_POLL_TIMEOUT`] — masses
+    /// need to already be jogged above ~10mm before Start Auto.
     pub fn init(bus: &mut dyn Bus, xy_pre_balance: bool, weights: &TuningWeights) -> Option<Self> {
         for addr in 1..=4u8 {
             mks_ops::run_rel(bus, addr, -0.001, 50.0, 128);
@@ -78,7 +83,7 @@ impl MpcLoop {
         }
         let mut d0 = [0.0f64; 4];
         let started = std::time::Instant::now();
-        while d0.iter().any(|&d| d < 0.01) {
+        while d0.iter().any(|&d| d < INIT_MIN_D) {
             if started.elapsed() > INIT_POLL_TIMEOUT {
                 return None;
             }
@@ -222,6 +227,7 @@ impl MpcLoop {
         self.t += PLANT_T;
 
         Telemetry {
+            run_state: crate::telemetry::RunState::Mpc,
             connected: true,
             is_sample: true,
             manual_read: None,

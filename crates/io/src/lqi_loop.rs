@@ -129,10 +129,15 @@ pub struct LqiLoop {
 /// whole IO thread with no feedback if masses start too close to home.
 const INIT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `init`'s encoder-priming poll won't return until every axis clears this —
+/// exposed so the UI can warn *before* Start Auto blocks for up to
+/// [`INIT_POLL_TIMEOUT`] and fails.
+pub const INIT_MIN_D: f64 = 0.05;
+
 impl LqiLoop {
     /// `InitLQR(app)` + the encoder-priming sequence. `None` if the poll
-    /// never reaches the 0.05m threshold within [`INIT_POLL_TIMEOUT`] —
-    /// masses need to already be jogged above ~50mm before Start Auto.
+    /// never reaches [`INIT_MIN_D`] within [`INIT_POLL_TIMEOUT`] — masses
+    /// need to already be jogged above ~50mm before Start Auto.
     pub fn init(bus: &mut dyn Bus, weights: &LqiWeights) -> Option<Self> {
         let (kx, ki) = solve_gains(weights)?;
 
@@ -142,7 +147,7 @@ impl LqiLoop {
             sleep(MOTOR_PAUSE);
         }
         let started = std::time::Instant::now();
-        while d0.iter().any(|&d| d < 0.05) {
+        while d0.iter().any(|&d| d < INIT_MIN_D) {
             if started.elapsed() > INIT_POLL_TIMEOUT {
                 return None;
             }
@@ -303,6 +308,7 @@ impl LqiLoop {
         self.t += plant_t;
 
         Telemetry {
+            run_state: crate::telemetry::RunState::Lqi,
             connected: true,
             is_sample: true,
             manual_read: None,

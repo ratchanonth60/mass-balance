@@ -1,7 +1,7 @@
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use io::commands::{MassSolver, RunMode, TuneWeights, UiCommand};
-use io::telemetry::Telemetry;
+use io::telemetry::{RunState, Telemetry};
 use io::transport::SerialBus;
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -12,6 +12,9 @@ const HISTORY_LEN: usize = 300;
 const WINDOW_SECS: f64 = 120.0;
 const WEIGHTS_PATH: &str = "tune_weights.json";
 const PRESET_XY_PATH: &str = "preset_xy.json";
+/// Rail travel range — matches `D_MAX` in `mpc_loop`/`lqi_loop`. Used only
+/// for the axis progress bars' fill fraction, not sent anywhere.
+const RAIL_MAX_M: f64 = 0.495;
 
 /// `PresetXY.mat` -> `preset_xy.json` (M5). Matches the field name the M0
 /// `.mat`->JSON converter emitted (`fixtures/preset_xy.json`'s `presetXY` key).
@@ -21,18 +24,34 @@ struct PresetXy {
     preset_xy: [f64; 4],
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum Tab {
-    Setup,
-    MotorControl,
-    Monitor,
+/// `(label, color)` for a `RunState` — used in the header chip.
+fn run_state_chip(state: RunState) -> (&'static str, egui::Color32) {
+    match state {
+        RunState::Idle => ("Idle", egui::Color32::GRAY),
+        RunState::Manual => ("Manual poll", egui::Color32::from_rgb(90, 140, 220)),
+        RunState::Mpc => ("▶ MPC", egui::Color32::from_rgb(80, 180, 80)),
+        RunState::Lqi => ("▶ LQI", egui::Color32::from_rgb(80, 180, 80)),
+    }
+}
+
+/// `(label, color)` for an `exitflag` — same codes in both loops
+/// (`mpc_loop.rs`/`lqi_loop.rs`): `1` solved, `-99` the actuator-tracking
+/// gate held and the solve was skipped, `-1` infeasible (MPC only, holds the
+/// previous command), `0` controller off.
+fn exitflag_badge(flag: i32) -> (&'static str, egui::Color32) {
+    match flag {
+        1 => ("✔ solved", egui::Color32::from_rgb(80, 180, 80)),
+        -99 => ("⏳ gate held", egui::Color32::from_rgb(220, 160, 60)),
+        -1 => ("⚠ infeasible", egui::Color32::from_rgb(200, 80, 60)),
+        0 => ("off", egui::Color32::GRAY),
+        _ => ("?", egui::Color32::GRAY),
+    }
 }
 
 struct AutomassApp {
     tx: Sender<UiCommand>,
     rx: Receiver<Telemetry>,
 
-    tab: Tab,
     ports: Vec<String>,
     selected_port: String,
     connected: bool,
@@ -47,6 +66,9 @@ struct AutomassApp {
     setpoint_roll: f64,
     setpoint_pitch: f64,
     weights: TuneWeights,
+    /// Result line under Tune Now/Save/Load — both used to swallow their
+    /// `io::Result`/`serde_json::Result` and fail completely silently.
+    weights_msg: String,
 
     jog_dist_cm: f64,
     manual_poll: bool,
@@ -55,7 +77,7 @@ struct AutomassApp {
     history: VecDeque<Telemetry>,
     status_line: String,
     /// Last manual `Read encoder` result per axis (index = addr-1) — shown
-    /// on the Motor Control cards even while idle, when `latest.d_meas`
+    /// on the rig panel's axis cards even while idle, when `latest.d_meas`
     /// is meaningless (no loop running to have produced it).
     manual_d_meas: [Option<f64>; 4],
     /// Wall-clock baseline for the plot's zero-order-hold synthetic point —
@@ -79,7 +101,6 @@ impl AutomassApp {
         Self {
             tx,
             rx,
-            tab: Tab::Setup,
             ports: SerialBus::list_ports(),
             selected_port: String::new(),
             connected: false,
@@ -90,7 +111,7 @@ impl AutomassApp {
             // takes the `else` branch and runs `ModelInit(app, d0)` — the
             // GUI-tunable preset. Defaulting this to `true` here silently put
             // the rig on `ModelInit_PostBalance`'s hardcoded tuning instead,
-            // with the whole Tuning tab inert.
+            // with the whole Tuning panel inert.
             xy_pre_balance: false,
             controller_on: true,
             mass_solver: MassSolver::Pinv,
@@ -98,6 +119,7 @@ impl AutomassApp {
             setpoint_roll: 0.0,
             setpoint_pitch: 0.0,
             weights,
+            weights_msg: String::new(),
             jog_dist_cm: 0.0,
             manual_poll: false,
             latest: Telemetry::default(),
@@ -120,6 +142,20 @@ impl AutomassApp {
             self.status_line = tel.status.clone();
             self.connected = tel.connected;
             self.connecting = false;
+            // Always current, unlike the rest of `latest` below — a failed
+            // `StartAuto` (init timeout, gain solve failure) or a loop panic
+            // reports `Idle` through a standalone status snapshot
+            // (`is_sample` false), not a real sample, so it has to be read
+            // here or the header chip and the `running` correction below
+            // would never see it.
+            self.latest.run_state = tel.run_state;
+            if tel.run_state == RunState::Idle {
+                // Recovers `running` from a failed Start Auto or a loop
+                // panic without waiting on the Stop button — see the
+                // `RunState` doc comment in `io::telemetry` for why this
+                // exists.
+                self.running = false;
+            }
             if let Some((addr, v)) = tel.manual_read {
                 self.manual_d_meas[addr as usize - 1] = Some(v);
             }
@@ -140,6 +176,42 @@ impl AutomassApp {
             }
         }
     }
+
+    /// Best-known reading per axis for the preflight check: live if a loop
+    /// or the manual live-read poll is running, else the last one-shot
+    /// `Read encoder` result, else unknown (`None`) — a stale one-shot read
+    /// is the weakest signal, and no reading at all means "ask the operator
+    /// to check" rather than silently assuming either way.
+    fn axis_readiness(&self) -> [Option<f64>; 4] {
+        if matches!(
+            self.latest.run_state,
+            RunState::Mpc | RunState::Lqi | RunState::Manual
+        ) {
+            self.latest.d_meas.map(Some)
+        } else {
+            self.manual_d_meas
+        }
+    }
+
+    /// Share of the plot window's samples that landed on the `d_track_tol`
+    /// gate (`exitflag == -99`, solve skipped). A single instantaneous flag
+    /// doesn't show a *trend* — a climbing gate rate is the actual signal
+    /// that motor speed/tolerance need attention, one held cycle isn't.
+    fn gate_rate_pct(&self) -> f64 {
+        let mut total = 0usize;
+        let mut gated = 0usize;
+        for t in self.windowed_history() {
+            total += 1;
+            if t.exitflag == -99 {
+                gated += 1;
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * gated as f64 / total as f64
+        }
+    }
 }
 
 impl eframe::App for AutomassApp {
@@ -148,10 +220,9 @@ impl eframe::App for AutomassApp {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
 
-        // Header: connection + live roll/pitch + Stop are always visible
-        // regardless of which tab is open. Previously Stop only lived on the
-        // Setup tab — an operator watching convergence on Monitor had to
-        // switch tabs to kill a runaway loop.
+        // Header: connection, live roll/pitch, run state + solver health,
+        // and Stop are always visible — no tabs, so nothing to switch away
+        // from to reach them.
         egui::Panel::top("header").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(if self.connected { "🟢" } else { "🔴" });
@@ -189,6 +260,7 @@ impl eframe::App for AutomassApp {
                     if ui.button("Disconnect").clicked() {
                         self.send(UiCommand::Disconnect);
                         self.running = false;
+                        self.latest.run_state = RunState::Idle;
                     }
                 }
 
@@ -201,130 +273,65 @@ impl eframe::App for AutomassApp {
                 );
 
                 ui.separator();
-                if self.running {
-                    if ui
-                        .add(egui::Button::new("■ Stop").fill(egui::Color32::from_rgb(140, 20, 20)))
-                        .clicked()
-                    {
-                        self.send(UiCommand::Stop);
-                        self.running = false;
-                    }
-                    ui.label(format!("running ({:?})", self.run_mode));
+                let (chip_text, chip_color) = run_state_chip(self.latest.run_state);
+                ui.label(egui::RichText::new(chip_text).color(chip_color).strong());
+                if matches!(self.latest.run_state, RunState::Mpc | RunState::Lqi) {
+                    ui.label(format!("cycle {}", self.latest.cycle));
+                    let (flag_text, flag_color) = exitflag_badge(self.latest.exitflag);
+                    ui.label(egui::RichText::new(flag_text).color(flag_color));
+                    ui.label(format!("gate {:.0}%", self.gate_rate_pct()));
                 }
-            });
 
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Setup, "Setup / Home");
-                ui.selectable_value(&mut self.tab, Tab::MotorControl, "Motor Control");
-                ui.selectable_value(&mut self.tab, Tab::Monitor, "Tuning / States / Monitor");
+                ui.separator();
+                if self.running
+                    && ui
+                        .add(
+                            egui::Button::new("■ Stop")
+                                .fill(egui::Color32::from_rgb(140, 20, 20)),
+                        )
+                        .clicked()
+                {
+                    self.send(UiCommand::Stop);
+                    self.running = false;
+                    // `Stop` doesn't produce a `Telemetry` on the IO side
+                    // (nothing left to send it from once the loop stops
+                    // iterating) — patch the chip directly instead of
+                    // leaving it stuck on the last mode shown.
+                    self.latest.run_state = RunState::Idle;
+                }
             });
         });
 
-        // Full status/diagnostic line at the bottom — was crammed into the
-        // tab row before, truncating the longer diagnostic strings (e.g.
-        // "Encoder[1]: 10 bytes, unparsable: [FB, 01, ...]").
+        // Full status/diagnostic line at the bottom — long diagnostic
+        // strings (e.g. "Encoder[1]: 10 bytes, unparsable: [FB, 01, ...]")
+        // get the full window width instead of competing with tab labels.
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(format!("Status: {}", self.status_line));
         });
 
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Setup => self.setup_tab(ui),
-            Tab::MotorControl => self.motor_control_tab(ui),
-            Tab::Monitor => self.monitor_tab(ui),
-        });
+        egui::Panel::left("rig")
+            .default_size(300.0)
+            .min_size(240.0)
+            .show(ui, |ui| self.rig_panel(ui));
+
+        egui::Panel::right("run")
+            .default_size(320.0)
+            .min_size(260.0)
+            .show(ui, |ui| self.run_panel(ui));
+
+        egui::CentralPanel::default().show(ui, |ui| self.monitor_panel(ui));
     }
 }
 
 impl AutomassApp {
-    fn setup_tab(&mut self, ui: &mut egui::Ui) {
-        // Connect/disconnect moved to the always-visible header — see `ui()`.
-        ui.heading("Auto-balance");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.run_mode, RunMode::Mpc, "MPC");
-            ui.radio_value(&mut self.run_mode, RunMode::Lqi, "LQI");
-        });
-        ui.checkbox(
-            &mut self.xy_pre_balance,
-            "XY pre-balanced (ModelInit_PostBalance)",
-        );
-        if ui
-            .checkbox(&mut self.controller_on, "Controller On")
-            .changed()
-        {
-            self.send(UiCommand::SetController(self.controller_on));
-        }
-
-        // Stop lives in the always-visible header now — an operator on the
-        // Monitor tab watching convergence shouldn't have to switch tabs to
-        // kill a runaway loop.
-        if ui
-            .add_enabled(
-                !self.running && self.connected,
-                egui::Button::new("▶ Start Auto"),
-            )
-            .clicked()
-        {
-            // Manual live-read poll occupies the same `Run` slot on
-            // the IO thread — StartAuto silently supersedes it
-            // there, so drop the client-side flag to match.
-            self.manual_poll = false;
-            // Every new session's `t` clock restarts at 0 on the IO
-            // side (`MpcLoop`/`LqiLoop::init`) — old history entries
-            // from a previous session have larger `t`, so leaving
-            // them in makes the plot line jump backward in time and
-            // connect across sessions. Start clean.
-            self.history.clear();
-            self.session_start = std::time::Instant::now();
-            self.send(UiCommand::SetXyPreBalance(self.xy_pre_balance));
-            self.send(UiCommand::UpdateWeights(self.weights));
-            self.send(UiCommand::SetMassSolver(self.mass_solver));
-            self.send(UiCommand::StartAuto(self.run_mode));
-            self.running = true;
-        }
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Roll setpoint (deg)");
-            if ui
-                .add(egui::DragValue::new(&mut self.setpoint_roll).speed(0.1))
-                .changed()
-                || ui.label("Pitch setpoint (deg)").clicked()
-            {
-                self.send(UiCommand::SetSetpoint {
-                    roll_deg: self.setpoint_roll,
-                    pitch_deg: self.setpoint_pitch,
-                });
-            }
-            if ui
-                .add(egui::DragValue::new(&mut self.setpoint_pitch).speed(0.1))
-                .changed()
-            {
-                self.send(UiCommand::SetSetpoint {
-                    roll_deg: self.setpoint_roll,
-                    pitch_deg: self.setpoint_pitch,
-                });
-            }
-        });
-    }
-
-    fn motor_control_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Manual jog");
-        ui.horizontal(|ui| {
-            ui.label("Distance (cm)");
-            ui.add(egui::DragValue::new(&mut self.jog_dist_cm).speed(0.1));
-            // Speed/accel now live in the Tuning grid (Monitor tab) — saved
-            // and loaded alongside the MPC weights instead of being a
-            // separate untracked pair of fields. Shown read-only here so
-            // it's still visible while jogging.
-            ui.label(format!(
-                "Speed {:.0} RPM / Accel {} (edit in Tuning tab)",
-                self.weights.jog_spd, self.weights.jog_acc
-            ));
-        });
-        ui.label(
-            "Shared distance/speed/accel above — each axis card below acts on that axis only,",
-        );
-        ui.label("or use the buttons here to apply to all 4 axes at once:");
+    /// Left panel: everything about the physical rig — per-axis readouts
+    /// and jog controls, home, encoder reads, XY preset. Grouped here
+    /// instead of a separate tab because prepping the rig (jogging masses
+    /// above the auto-balance init threshold) is the step right before
+    /// hitting Start on the right, and used to require a tab switch between
+    /// the two.
+    fn rig_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Rig");
         // Jog/home while an MPC/LQI loop is running fights the controller —
         // the IO thread drains manual commands between control cycles, so
         // they *do* fire, just not safely. Reading encoders is harmless
@@ -342,9 +349,81 @@ impl AutomassApp {
                 .weak(),
             );
         }
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("rig_axes_scroll")
+            .show(ui, |ui| {
+                for i in 0..4 {
+                    let addr = i as u8 + 1;
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        let row = ui.horizontal(|ui| {
+                            ui.strong(format!("Ax{addr}"));
+                            ui.label(format!("{:.2} cm", self.latest.d_meas[i] * 100.0));
+                        });
+                        row.response.on_hover_text(format!(
+                            "d_cmd {:.3} cm — last one-shot read: {}",
+                            self.latest.d_cmd[i] * 100.0,
+                            match self.manual_d_meas[i] {
+                                Some(v) => format!("{:.3} cm", v * 100.0),
+                                None => "-".to_string(),
+                            }
+                        ));
+                        let frac = (self.latest.d_meas[i] / RAIL_MAX_M).clamp(0.0, 1.0) as f32;
+                        ui.add(egui::ProgressBar::new(frac));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(can_move, egui::Button::new("→"))
+                                .on_hover_text("Go (absolute)")
+                                .clicked()
+                            {
+                                self.send(UiCommand::JogAbsolute {
+                                    addr,
+                                    dist_m: self.jog_dist_cm / 100.0,
+                                    spd: self.weights.jog_spd,
+                                    acc: self.weights.jog_acc,
+                                });
+                            }
+                            if ui
+                                .add_enabled(can_move, egui::Button::new("±"))
+                                .on_hover_text("Shift (relative)")
+                                .clicked()
+                            {
+                                self.send(UiCommand::JogRelative {
+                                    addr,
+                                    dist_m: self.jog_dist_cm / 100.0,
+                                    spd: self.weights.jog_spd,
+                                    acc: self.weights.jog_acc,
+                                });
+                            }
+                            if ui
+                                .add_enabled(self.connected, egui::Button::new("⟳"))
+                                .on_hover_text("Read encoder")
+                                .clicked()
+                            {
+                                self.send(UiCommand::ReadEncoder(addr));
+                            }
+                        });
+                    });
+                }
+            });
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("dist");
+            ui.add(egui::DragValue::new(&mut self.jog_dist_cm).speed(0.1).suffix(" cm"));
+        });
+        // Speed/accel live in the Tuning panel — saved and loaded alongside
+        // the MPC weights instead of a separate untracked pair of fields.
+        // Shown read-only here so it's still visible while jogging.
+        ui.label(format!(
+            "Speed {:.0} RPM / Accel {} (edit in Tuning)",
+            self.weights.jog_spd, self.weights.jog_acc
+        ));
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(can_move, egui::Button::new("Go all (absolute)"))
+                .add_enabled(can_move, egui::Button::new("Go all"))
                 .clicked()
             {
                 for addr in 1..=4u8 {
@@ -357,7 +436,7 @@ impl AutomassApp {
                 }
             }
             if ui
-                .add_enabled(can_move, egui::Button::new("Shift all (relative)"))
+                .add_enabled(can_move, egui::Button::new("Shift all"))
                 .clicked()
             {
                 for addr in 1..=4u8 {
@@ -369,83 +448,15 @@ impl AutomassApp {
                     });
                 }
             }
-            if ui
-                .add_enabled(self.connected, egui::Button::new("Read all encoders"))
-                .clicked()
-            {
-                for addr in 1..=4u8 {
-                    self.send(UiCommand::ReadEncoder(addr));
-                }
-            }
         });
         if ui
-            .checkbox(
-                &mut self.manual_poll,
-                "🔴 Live read (poll encoders, no motor commands)",
-            )
-            .changed()
+            .add_enabled(self.connected, egui::Button::new("Read all encoders"))
+            .clicked()
         {
-            if self.manual_poll {
-                self.history.clear(); // new session, `t` clock restarts at 0
-                self.session_start = std::time::Instant::now();
+            for addr in 1..=4u8 {
+                self.send(UiCommand::ReadEncoder(addr));
             }
-            self.send(UiCommand::SetManualPoll(self.manual_poll));
         }
-        if self.manual_poll {
-            ui.label("Polling all 4 axes every 0.5s — d_meas below updates live while you jog.");
-        }
-        ui.add_space(4.0);
-
-        // One card per physical axis instead of a single shared "Axis"
-        // picker — no more forgetting to change it before Go/Read.
-        ui.columns(4, |columns| {
-            for (i, col) in columns.iter_mut().enumerate() {
-                let addr = i as u8 + 1;
-                col.group(|ui| {
-                    ui.set_min_width(140.0);
-                    ui.vertical_centered(|ui| ui.strong(format!("Axis {addr}")));
-                    ui.separator();
-                    // Fed by whichever is currently running: a real MPC/LQI
-                    // loop, or the manual live-read poll above — both send
-                    // `is_sample` telemetry into `latest`.
-                    ui.label(format!("d_meas: {:.3} cm", self.latest.d_meas[i] * 100.0));
-                    ui.label(format!("d_cmd:  {:.3} cm", self.latest.d_cmd[i] * 100.0));
-                    ui.label(match self.manual_d_meas[i] {
-                        Some(v) => format!("last one-shot read: {:.3} cm", v * 100.0),
-                        None => "last one-shot read: -".to_string(),
-                    });
-                    ui.add_space(4.0);
-                    if ui
-                        .add_enabled(can_move, egui::Button::new("Go (absolute)"))
-                        .clicked()
-                    {
-                        self.send(UiCommand::JogAbsolute {
-                            addr,
-                            dist_m: self.jog_dist_cm / 100.0,
-                            spd: self.weights.jog_spd,
-                            acc: self.weights.jog_acc,
-                        });
-                    }
-                    if ui
-                        .add_enabled(can_move, egui::Button::new("Shift (relative)"))
-                        .clicked()
-                    {
-                        self.send(UiCommand::JogRelative {
-                            addr,
-                            dist_m: self.jog_dist_cm / 100.0,
-                            spd: self.weights.jog_spd,
-                            acc: self.weights.jog_acc,
-                        });
-                    }
-                    if ui
-                        .add_enabled(self.connected, egui::Button::new("Read encoder"))
-                        .clicked()
-                    {
-                        self.send(UiCommand::ReadEncoder(addr));
-                    }
-                });
-            }
-        });
 
         ui.separator();
         // `HomeButtonPushed`: sends 0x91 (MKS "go home") to all 4 axes —
@@ -464,7 +475,6 @@ impl AutomassApp {
             self.manual_d_meas = [None; 4]; // stale the instant homing starts
             self.status_line = "Homing all 4 axes — wait for motion to stop".to_string();
         }
-        ui.separator();
         // `XYButtonPushed`/`XYZButtonPushed`: load('PresetXY.mat') then drive
         // all 4 axes there — replaced by `preset_xy.json` (M5).
         if ui
@@ -499,7 +509,56 @@ impl AutomassApp {
                 }
             }
         }
+
         ui.separator();
+        if ui
+            .checkbox(
+                &mut self.manual_poll,
+                "🔴 Live read (poll encoders, no motor commands)",
+            )
+            .changed()
+        {
+            if self.manual_poll {
+                self.history.clear(); // new session, `t` clock restarts at 0
+                self.session_start = std::time::Instant::now();
+            }
+            self.send(UiCommand::SetManualPoll(self.manual_poll));
+        }
+        if self.manual_poll {
+            ui.label("Polling all 4 axes every 0.5s.");
+        }
+    }
+
+    /// Right panel: mode/preset/controller, setpoints, preflight, Start —
+    /// then the Tuning weights grid below, since tuning and running are the
+    /// two things an operator alternates between second-to-second and used
+    /// to be a tab switch apart.
+    fn run_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Run");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.run_mode, RunMode::Mpc, "MPC");
+            ui.radio_value(&mut self.run_mode, RunMode::Lqi, "LQI");
+        });
+        ui.checkbox(
+            &mut self.xy_pre_balance,
+            "XY pre-balanced (ModelInit_PostBalance)",
+        );
+        if ui
+            .checkbox(&mut self.controller_on, "Controller On")
+            .changed()
+        {
+            self.send(UiCommand::SetController(self.controller_on));
+        }
+        if !self.controller_on {
+            ui.label(
+                egui::RichText::new(
+                    "⚠ Controller off — loop keeps running (KF/solve) but sends no motor commands.",
+                )
+                .color(egui::Color32::from_rgb(220, 120, 60)),
+            );
+        }
+
+        ui.add_space(4.0);
         ui.label("Allocation solver (LQI path)");
         ui.horizontal(|ui| {
             if ui
@@ -512,14 +571,199 @@ impl AutomassApp {
                 self.send(UiCommand::SetMassSolver(self.mass_solver));
             }
         });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Roll setpoint (deg)");
+            if ui
+                .add(egui::DragValue::new(&mut self.setpoint_roll).speed(0.1))
+                .changed()
+            {
+                self.send(UiCommand::SetSetpoint {
+                    roll_deg: self.setpoint_roll,
+                    pitch_deg: self.setpoint_pitch,
+                });
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Pitch setpoint (deg)");
+            if ui
+                .add(egui::DragValue::new(&mut self.setpoint_pitch).speed(0.1))
+                .changed()
+            {
+                self.send(UiCommand::SetSetpoint {
+                    roll_deg: self.setpoint_roll,
+                    pitch_deg: self.setpoint_pitch,
+                });
+            }
+        });
+
+        ui.separator();
+        // Preflight: both loops' `init` blocks the IO thread — with zero
+        // feedback beyond a "Initializing..." status line — for up to a
+        // full minute before reporting failure if the masses aren't already
+        // jogged above this threshold. Warn ahead of time instead of
+        // silently eating that minute. Never blocks Start: a stale one-shot
+        // read is not authoritative, and the operator may know the rig is
+        // ready even if the UI's last reading is old.
+        let min_d = match self.run_mode {
+            RunMode::Mpc => io::mpc_loop::INIT_MIN_D,
+            RunMode::Lqi => io::lqi_loop::INIT_MIN_D,
+        };
+        let readiness = self.axis_readiness();
+        if readiness.iter().any(|v| v.is_none()) {
+            ui.label(
+                egui::RichText::new("↻ Read all encoders (left panel) to check readiness")
+                    .weak(),
+            );
+        } else {
+            let below: Vec<String> = readiness
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| {
+                    v.filter(|&d| d < min_d)
+                        .map(|d| format!("Ax{} {:.1} cm", i + 1, d * 100.0))
+                })
+                .collect();
+            if below.is_empty() {
+                ui.label(
+                    egui::RichText::new("✔ all axes ready")
+                        .color(egui::Color32::from_rgb(80, 180, 80)),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠ {} below {:.1} cm — jog up first",
+                        below.join(", "),
+                        min_d * 100.0
+                    ))
+                    .color(egui::Color32::from_rgb(220, 160, 60)),
+                );
+            }
+        }
+
+        if ui
+            .add_enabled(
+                !self.running && self.connected,
+                egui::Button::new("▶ Start Auto"),
+            )
+            .clicked()
+        {
+            // Manual live-read poll occupies the same `Run` slot on
+            // the IO thread — StartAuto silently supersedes it
+            // there, so drop the client-side flag to match.
+            self.manual_poll = false;
+            // Every new session's `t` clock restarts at 0 on the IO
+            // side (`MpcLoop`/`LqiLoop::init`) — old history entries
+            // from a previous session have larger `t`, so leaving
+            // them in makes the plot line jump backward in time and
+            // connect across sessions. Start clean.
+            self.history.clear();
+            self.session_start = std::time::Instant::now();
+            self.send(UiCommand::SetXyPreBalance(self.xy_pre_balance));
+            self.send(UiCommand::UpdateWeights(self.weights));
+            self.send(UiCommand::SetMassSolver(self.mass_solver));
+            self.send(UiCommand::StartAuto(self.run_mode));
+            self.running = true;
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        // Nested scroll area, not the whole panel — Run controls above stay
+        // pinned and reachable even on a short window; only the (long)
+        // weights grid needs its own scroll to still reach Tune Now.
+        egui::ScrollArea::vertical()
+            .id_salt("tuning_scroll")
+            .show(ui, |ui| self.tuning_panel(ui));
     }
 
-    /// Merged former Tuning + States + Monitor tabs onto one page: weights
-    /// grid/buttons on top, live numeric grid, plots below. States/Monitor
-    /// portion is only ever fed by `is_sample` telemetry (see
-    /// `drain_telemetry`) — command-status snapshots no longer leak in as
-    /// bogus `(t=0, y=0)` points, which was the main cause of the plot
-    /// jumping/snapping instead of drawing a continuous line.
+    fn tuning_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Tuning");
+        // `ModelInit_PostBalance.m` hardcodes its own q/qi/qd/R/du_max/
+        // d_track_tol and never reads the GUI — so with the preset
+        // checkbox on, every weight below except speed/accel is dead and
+        // `Tune Now` re-linearizes with the same numbers. Silent in
+        // MATLAB; say it out loud instead of letting an operator drag
+        // knobs that do nothing.
+        if self.xy_pre_balance && self.run_mode == RunMode::Mpc {
+            ui.label(
+                egui::RichText::new(
+                    "⚠ 'XY pre-balanced' is on — MPC uses ModelInit_PostBalance's \
+                     hardcoded weights and ignores everything below except speed/accel.",
+                )
+                .color(egui::Color32::from_rgb(220, 160, 60)),
+            );
+        }
+        egui::Grid::new("weights_grid")
+            .num_columns(2)
+            .show(ui, |ui| {
+                for (i, label) in ["q1", "q2", "q3", "q4", "q5"].iter().enumerate() {
+                    ui.label(*label);
+                    ui.add(egui::DragValue::new(&mut self.weights.q[i]).speed(1.0));
+                    ui.end_row();
+                }
+                for (i, label) in ["qi1", "qi2"].iter().enumerate() {
+                    ui.label(*label);
+                    ui.add(egui::DragValue::new(&mut self.weights.qi[i]).speed(0.1));
+                    ui.end_row();
+                }
+                ui.label("qd");
+                ui.add(egui::DragValue::new(&mut self.weights.qd).speed(1.0));
+                ui.end_row();
+                ui.label("R");
+                ui.add(egui::DragValue::new(&mut self.weights.r).speed(1.0));
+                ui.end_row();
+                ui.label("du_max (m)");
+                ui.add(egui::DragValue::new(&mut self.weights.du_max).speed(0.001));
+                ui.end_row();
+                ui.label("d_track_tol (m)");
+                ui.add(egui::DragValue::new(&mut self.weights.d_track_tol).speed(0.001));
+                ui.end_row();
+                // Not an MPC/LQI model weight, but MATLAB's loop feeds
+                // these same two spinners to every motor command it
+                // sends — so they set both manual-jog and auto-balance
+                // move speed. `Tune Now` pushes them into a running loop.
+                ui.label("motor speed (RPM)");
+                ui.add(egui::DragValue::new(&mut self.weights.jog_spd).speed(1.0));
+                ui.end_row();
+                ui.label("motor accel");
+                ui.add(egui::DragValue::new(&mut self.weights.jog_acc).range(0..=255));
+                ui.end_row();
+            });
+
+        ui.horizontal(|ui| {
+            if ui.button("Tune Now").clicked() {
+                self.send(UiCommand::UpdateWeights(self.weights));
+                self.send(UiCommand::TuneNow);
+                self.weights_msg = "Sent updated weights + Tune Now".to_string();
+            }
+            if ui.button("Save weights").clicked() {
+                self.weights_msg = match serde_json::to_string_pretty(&self.weights) {
+                    Ok(json) => match std::fs::write(WEIGHTS_PATH, json) {
+                        Ok(()) => format!("Saved to {WEIGHTS_PATH}"),
+                        Err(e) => format!("Save failed: {e}"),
+                    },
+                    Err(e) => format!("Save failed: {e}"),
+                };
+            }
+            if ui.button("Load weights").clicked() {
+                self.weights_msg = match std::fs::read_to_string(WEIGHTS_PATH) {
+                    Ok(s) => match serde_json::from_str(&s) {
+                        Ok(w) => {
+                            self.weights = w;
+                            format!("Loaded {WEIGHTS_PATH}")
+                        }
+                        Err(e) => format!("Load failed: bad JSON ({e})"),
+                    },
+                    Err(e) => format!("Load failed: {e}"),
+                };
+            }
+        });
+        if !self.weights_msg.is_empty() {
+            ui.label(egui::RichText::new(&self.weights_msg).weak());
+        }
+    }
+
     /// Points from the trailing `WINDOW_SECS` of `history` only — bounds the
     /// plot to a scrolling live window instead of the whole 300-sample
     /// buffer (up to ~16min at MPC's 2s cadence), so the view doesn't keep
@@ -623,81 +867,13 @@ impl AutomassApp {
         ui.label(format!("roll {roll:.2}°  pitch {pitch:.2}°"));
     }
 
-    fn monitor_tab(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("⚙ Tuning (MPC + LQI weights, motor speed/accel)", |ui| {
-            // `ModelInit_PostBalance.m` hardcodes its own q/qi/qd/R/du_max/
-            // d_track_tol and never reads the GUI — so with the preset
-            // checkbox on, every weight below except speed/accel is dead and
-            // `Tune Now` re-linearizes with the same numbers. Silent in
-            // MATLAB; say it out loud instead of letting an operator drag
-            // knobs that do nothing.
-            if self.xy_pre_balance && self.run_mode == RunMode::Mpc {
-                ui.label(
-                    egui::RichText::new(
-                        "⚠ 'XY pre-balanced' is on — MPC uses ModelInit_PostBalance's \
-                         hardcoded weights and ignores everything below except speed/accel.",
-                    )
-                    .color(egui::Color32::from_rgb(220, 160, 60)),
-                );
-            }
-            egui::Grid::new("weights_grid")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    for (i, label) in ["q1", "q2", "q3", "q4", "q5"].iter().enumerate() {
-                        ui.label(*label);
-                        ui.add(egui::DragValue::new(&mut self.weights.q[i]).speed(1.0));
-                        ui.end_row();
-                    }
-                    for (i, label) in ["qi1", "qi2"].iter().enumerate() {
-                        ui.label(*label);
-                        ui.add(egui::DragValue::new(&mut self.weights.qi[i]).speed(0.1));
-                        ui.end_row();
-                    }
-                    ui.label("qd");
-                    ui.add(egui::DragValue::new(&mut self.weights.qd).speed(1.0));
-                    ui.end_row();
-                    ui.label("R");
-                    ui.add(egui::DragValue::new(&mut self.weights.r).speed(1.0));
-                    ui.end_row();
-                    ui.label("du_max (m)");
-                    ui.add(egui::DragValue::new(&mut self.weights.du_max).speed(0.001));
-                    ui.end_row();
-                    ui.label("d_track_tol (m)");
-                    ui.add(egui::DragValue::new(&mut self.weights.d_track_tol).speed(0.001));
-                    ui.end_row();
-                    // Not an MPC/LQI model weight, but MATLAB's loop feeds
-                    // these same two spinners to every motor command it
-                    // sends — so they set both manual-jog and auto-balance
-                    // move speed. `Tune Now` pushes them into a running loop.
-                    ui.label("motor speed (RPM)");
-                    ui.add(egui::DragValue::new(&mut self.weights.jog_spd).speed(1.0));
-                    ui.end_row();
-                    ui.label("motor accel");
-                    ui.add(egui::DragValue::new(&mut self.weights.jog_acc).range(0..=255));
-                    ui.end_row();
-                });
-
-            ui.horizontal(|ui| {
-                if ui.button("Tune Now").clicked() {
-                    self.send(UiCommand::UpdateWeights(self.weights));
-                    self.send(UiCommand::TuneNow);
-                }
-                if ui.button("Save weights").clicked()
-                    && let Ok(json) = serde_json::to_string_pretty(&self.weights)
-                {
-                    let _ = std::fs::write(WEIGHTS_PATH, json);
-                }
-                if ui.button("Load weights").clicked()
-                    && let Ok(s) = std::fs::read_to_string(WEIGHTS_PATH)
-                    && let Ok(w) = serde_json::from_str(&s)
-                {
-                    self.weights = w;
-                }
-            });
-        });
-
-        ui.separator();
-
+    /// Center panel: live states strip, tilt-plate sanity check, and the two
+    /// history plots. Everything here is only ever fed by `is_sample`
+    /// telemetry (see `drain_telemetry`) — command-status snapshots no
+    /// longer leak in as bogus `(t=0, y=0)` points, which was the main
+    /// cause of the plot jumping/snapping instead of drawing a continuous
+    /// line.
+    fn monitor_panel(&mut self, ui: &mut egui::Ui) {
         // Roll/pitch are what an operator actually watches second to
         // second — call them out big, everything else stays in the compact
         // grid beside it.
@@ -745,8 +921,16 @@ impl AutomassApp {
                         self.latest.d_cmd[3] * 100.0
                     ));
                     ui.end_row();
-                    ui.label("Exit flag / cycle");
-                    ui.label(format!("{} / {}", self.latest.exitflag, self.latest.cycle));
+                    ui.label("Solve / cycle / gate");
+                    ui.horizontal(|ui| {
+                        let (flag_text, flag_color) = exitflag_badge(self.latest.exitflag);
+                        ui.label(egui::RichText::new(flag_text).color(flag_color));
+                        ui.label(format!(
+                            "· cycle {} · {:.0}%",
+                            self.latest.cycle,
+                            self.gate_rate_pct()
+                        ));
+                    });
                     ui.end_row();
                 });
         });
@@ -755,44 +939,52 @@ impl AutomassApp {
         self.tilt_plate(ui);
         ui.separator();
 
-        // Side-by-side instead of stacked — both plots visible without
-        // scrolling on a normal window width.
-        ui.columns(2, |columns| {
-            let roll = self.hold_extended(|t| t.roll_deg);
-            let pitch = self.hold_extended(|t| t.pitch_deg);
-            columns[0].label("Angle (deg)");
-            Plot::new("angle_plot")
-                .height(260.0)
-                .x_axis_label("t (s)")
-                .y_axis_label("deg")
-                .legend(Legend::default())
-                // Fixed home-range Y anchor so the axis doesn't rescale on
-                // every new point while roll/pitch sit near 0 (still
-                // expands automatically if the angle actually exceeds this).
-                .include_y(-5.0)
-                .include_y(5.0)
-                .show(&mut columns[0], |plot_ui| {
-                    plot_ui.line(Line::new("roll", roll).width(2.0));
-                    plot_ui.line(Line::new("pitch", pitch).width(2.0));
-                });
+        // Stacked (Angle above Actuator positions), not side-by-side — full
+        // panel width per plot instead of splitting it, easier to read the
+        // trace against the longer time axis. Wrapped in a scroll area
+        // since two full-width plots plus the states strip and tilt plate
+        // no longer reliably fit a short window.
+        egui::ScrollArea::vertical()
+            .id_salt("monitor_plots_scroll")
+            .show(ui, |ui| {
+                let roll = self.hold_extended(|t| t.roll_deg);
+                let pitch = self.hold_extended(|t| t.pitch_deg);
+                ui.label("Angle (deg)");
+                Plot::new("angle_plot")
+                    .height(220.0)
+                    .x_axis_label("t (s)")
+                    .y_axis_label("deg")
+                    .legend(Legend::default())
+                    // Fixed home-range Y anchor so the axis doesn't rescale
+                    // on every new point while roll/pitch sit near 0 (still
+                    // expands automatically if the angle actually exceeds
+                    // this).
+                    .include_y(-5.0)
+                    .include_y(5.0)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(Line::new("roll", roll).width(2.0));
+                        plot_ui.line(Line::new("pitch", pitch).width(2.0));
+                    });
 
-            columns[1].label("Actuator positions (cm)");
-            Plot::new("d_plot")
-                .height(260.0)
-                .x_axis_label("t (s)")
-                .y_axis_label("cm")
-                .legend(Legend::default())
-                .include_y(0.0)
-                .include_y(50.0) // rail range is ~0-49.5cm (D_MAX)
-                .show(&mut columns[1], |plot_ui| {
-                    for axis in 0..4 {
-                        let meas = self.hold_extended(|t| t.d_meas[axis] * 100.0);
-                        let cmd = self.hold_extended(|t| t.d_cmd[axis] * 100.0);
-                        plot_ui.line(Line::new(format!("d{} meas", axis + 1), meas).width(2.0));
-                        plot_ui.line(Line::new(format!("d{} cmd", axis + 1), cmd).width(2.0));
-                    }
-                });
-        });
+                ui.add_space(8.0);
+                ui.label("Actuator positions (cm)");
+                Plot::new("d_plot")
+                    .height(220.0)
+                    .x_axis_label("t (s)")
+                    .y_axis_label("cm")
+                    .legend(Legend::default())
+                    .include_y(0.0)
+                    .include_y(50.0) // rail range is ~0-49.5cm (D_MAX)
+                    .show(ui, |plot_ui| {
+                        for axis in 0..4 {
+                            let meas = self.hold_extended(|t| t.d_meas[axis] * 100.0);
+                            let cmd = self.hold_extended(|t| t.d_cmd[axis] * 100.0);
+                            plot_ui
+                                .line(Line::new(format!("d{} meas", axis + 1), meas).width(2.0));
+                            plot_ui.line(Line::new(format!("d{} cmd", axis + 1), cmd).width(2.0));
+                        }
+                    });
+            });
     }
 }
 
